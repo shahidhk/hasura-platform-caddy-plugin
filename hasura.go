@@ -44,6 +44,11 @@ func setup(c *caddy.Controller) error {
 		}
 		baseDomain = c.Val() // use the value
 	}
+	cfg := httpserver.GetConfig(c)
+	mid := func(next httpserver.Handler) httpserver.Handler {
+		return Handler{Next: next}
+	}
+	cfg.AddMiddleware(mid)
 	return nil
 }
 
