@@ -27,8 +27,18 @@ func init() {
 		Action:     setup,
 	})
 
-	redisEndpoint = mustGetenv("REDIS_ENDPOINT")
-	sessionCookieKey = mustGetenv("SESSION_COOKIE_KEY")
+	redisEndpoint = os.Getenv("REDIS_ENDPOINT")
+	sessionCookieKey = os.Getenv("SESSION_COOKIE_KEY")
+
+	if redisEndpoint == "" {
+		redisEndpoint = "redis:6379"
+		log.Printf("warning: env REDIS_ENDPOINT not found, defaulting to %s", redisEndpoint)
+	}
+
+	if sessionCookieKey == "" {
+		sessionCookieKey = "token"
+		log.Printf("warning: env SESSION_COOKIE_KEY not found, defaulting to %s", sessionCookieKey)
+	}
 
 	redisClient = redis.NewClient(&redis.Options{
 		Addr: redisEndpoint,
@@ -148,13 +158,4 @@ func isElement(l []string, e string) bool {
 		}
 	}
 	return false
-}
-
-func mustGetenv(key string) string {
-	v := os.Getenv(key)
-	if v != "" {
-		return v
-	}
-	log.Fatalf("env var %s not found", key)
-	return ""
 }
