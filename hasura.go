@@ -2,7 +2,6 @@ package hasura
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -14,23 +13,13 @@ import (
 	"github.com/go-redis/redis"
 )
 
-const (
-	AuthzTokenPrefix = "Bearer "
-	baseDomain       = "example.com"
-)
-
 var (
-	REDIS_ENDPOINT     string
-	SESSION_COOKIE_KEY string
-	redisClient        *redis.Client
-	epoch              time.Time
+	baseDomain       string
+	redisEndpoint    string
+	sessionCookieKey string
+	redisClient      *redis.Client
+	epoch            time.Time
 )
-
-type TokenData struct {
-	XHasuraRole         string   `json:"X-Hasura-Role`
-	XHasuraAllowedRoles []string `json:"X-Hasura-Allowed-Roles`
-	XHasuraUserID       int      `json:"X-Hasura-User-Id"`
-}
 
 func init() {
 	caddy.RegisterPlugin("hasura", caddy.Plugin{
@@ -38,65 +27,55 @@ func init() {
 		Action:     setup,
 	})
 
-	REDIS_ENDPOINT = mustGetenv("REDIS_ENDPOINT")
-	SESSION_COOKIE_KEY = mustGetenv("SESSION_COOKIE_KEY")
+	redisEndpoint = mustGetenv("REDIS_ENDPOINT")
+	sessionCookieKey = mustGetenv("SESSION_COOKIE_KEY")
 
 	redisClient = redis.NewClient(&redis.Options{
-		Addr: REDIS_ENDPOINT,
+		Addr: redisEndpoint,
 	})
 
 	epoch, _ = time.Parse(time.RFC1123, "Thu, 01 Jan 1970 00:00:00 GMT")
 }
 
 func setup(c *caddy.Controller) error {
+	for c.Next() { // skip the directive name
+		if !c.NextArg() { // expect at least one value
+			return c.ArgErr() // otherwise it's an error
+		}
+		baseDomain = c.Val() // use the value
+	}
 	return nil
 }
 
-type HasuraHandler struct {
+// Handler is the plugin entrypoint
+type Handler struct {
 	Next httpserver.Handler
 }
 
-func (h HasuraHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
+func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, error) {
 
-	var token string
-	var tokenType string
-
-	// get cookie
-	c, err := r.Cookie(SESSION_COOKIE_KEY)
-	if err == http.ErrNoCookie {
-		// no cookie, get authorization header "Bearer <token>"
-		a := r.Header.Get("Authorization")
-		if a == "" {
-			// no authorization header, user is anonymous
+	// get token from cookie or authz header
+	token, tokenFrom, err := getToken(sessionCookieKey, r)
+	if err != nil {
+		// no cookie or authz header: anonymous user
+		if err == errCookieAuthzHeaderNotFound {
 			w.Header().Set("X-Hasura-Role", "anonymous")
 			w.Header().Set("X-Hasura-Allowed-Roles", "anonymous")
 			w.Header().Set("X-Hasura-User-Id", "0")
-		}
-		// we have authorization header
-		if strings.HasPrefix(a, AuthzTokenPrefix) {
-			// good authorization header
-			token = strings.TrimPrefix(a, AuthzTokenPrefix)
-			tokenType = "bearer"
 		} else {
-			// malformed authorization header error
-			return fmt.Fprintf(w, "malformed authorization header")
+			http.Error(w, errMalformedAuthzHeader.Error(), http.StatusBadRequest)
+			return 0, nil
 		}
-	} else if err == nil {
-		// we got cookie
-		token = c.Value
-		tokenType = "cookie"
-	} else if err != nil {
-		log.Fatal("error in checking cookie: ", err)
 	}
 
-	// look for token in redis
+	// we have the token, look it up in redis
 	data, err := redisClient.Get(token).Result()
 	if err == redis.Nil {
 		// no data in redis for this token
-		if tokenType == "cookie" {
+		if tokenFrom == tokenFromCookie {
 			// if cookie, expire the cookie
 			expireCookie := &http.Cookie{
-				Name:    SESSION_COOKIE_KEY,
+				Name:    sessionCookieKey,
 				Value:   "",
 				Path:    "/",
 				Domain:  "." + baseDomain,
@@ -104,21 +83,30 @@ func (h HasuraHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, e
 			}
 			http.SetCookie(w, expireCookie)
 			http.Redirect(w, r, r.URL.String(), http.StatusTemporaryRedirect)
+			return 0, nil
 		}
-		if tokenType == "bearer" {
+		if tokenFrom == tokenFromBearer {
 			// if bearer token, return unauthorized error
 			http.Error(w, "invalid authorization token", http.StatusUnauthorized)
+			return 0, nil
 		}
+
 	} else if err != nil {
 		// error contacting redis
 		log.Printf("error: redisClient.Get: %v", err)
+		http.Error(w, "cannot validate session", http.StatusInternalServerError)
+		return 0, nil
 	} else {
-		// we got data
-		var tokenData TokenData
+
+		// we got data from redis
+		var tokenData authData
 		err := json.Unmarshal([]byte(data), &tokenData)
 		if err != nil {
-			log.Printf("error: jsondata decode: %v", err)
+			log.Printf("error: redis jsondata decode: %v", err)
+			http.Error(w, "invalid session data", http.StatusInternalServerError)
+			return 0, nil
 		}
+
 		// get x-hasura-role header from request
 		xHasuraRole := r.Header.Get("X-Hasura-Role")
 
@@ -134,12 +122,16 @@ func (h HasuraHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) (int, e
 				w.Header().Set("X-Hasura-Role", xHasuraRole)
 			} else {
 				http.Error(w, "invalid x-hasura-role requested", http.StatusUnauthorized)
+				return 0, nil
 			}
 		}
 	}
 
 	w.Header().Set("X-Hasura-Session-Id", token)
+
+	// strip cookie and authorization header
 	w.Header().Del("Authorization")
+	w.Header().Del("Cookie")
 
 	return h.Next.ServeHTTP(w, r)
 }
